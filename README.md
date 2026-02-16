@@ -1,46 +1,44 @@
-# WSR Analysis Agent
+# WSR Analysis Agent (LangChain + LangGraph + Pinecone)
 
-This project provides a **production-friendly WSR Analysis Agent** for Delivery Assurance teams.
+This repository implements a production-oriented Delivery Assurance agent that:
+- Ingests **current and previous week** WSR files (`pdf`, `pptx`, `docx`, `txt`)
+- Cleans messy data (header/footer-like repeats, extra spaces, page markers)
+- Chunks and stores data in **Pinecone** with metadata
+- Analyzes risks/dependencies from structured and unstructured reports
+- Detects reporting gaps and generates recommendations
+- Tracks progress from previous week
 
-It supports:
-- Uploading WSR files in **PDF, PPTX, DOCX, and TXT**.
-- Cleaning noisy content (header/footer-like repeats, page markers, extra spaces).
-- Chunking content with section tags.
-- Storing chunk vectors + metadata in a local vector DB.
-- Running systematic analysis for:
-  - Risks
-  - Dependencies
-  - Reporting gaps
-  - Recommendations grounded in historical WSR context.
+## Tech Stack
+- **LangChain**: embeddings, LLM integration, document abstractions
+- **LangGraph**: stateful orchestration of analysis nodes
+- **Pinecone**: vector storage and metadata-filtered retrieval
 
 ## Project Structure
 
 ```text
-.
-├── src/
-│   └── wsr_assurance/
-│       ├── workflow.py            # extraction, cleaning, chunking, vector DB, analysis
-│       ├── delivery_assurance.py  # week-over-week comparison orchestration
-│       ├── pdf_analysis.py        # backward-compatible PDF helper
-│       └── __init__.py
-├── wsr_agent_workflow.py          # backward-compatible wrapper
-├── delivery_assurance_agent.py    # backward-compatible wrapper
-├── BRD_WSR_Agent.md
-├── FRD_AI_Delivery_Assurance_Agent.md
-├── TECHNICAL_DESIGN_WSR_Agent.md
-├── requirements.txt
-└── README.md
+src/wsr_assurance/
+├── workflow.py            # main LangGraph workflow and core logic
+├── delivery_assurance.py  # business entrypoint
+├── pdf_analysis.py        # compatibility helpers
+└── __init__.py
 ```
 
-## End-to-End Flow
+## Workflow Stages
+1. Extract current + previous file text
+2. Clean/normalize content
+3. Chunk with metadata (`account`, `project_name`, `week_date`, `doc_id`)
+4. Upsert chunks to Pinecone
+5. Retrieve historical context with metadata filters
+6. Analyze current and previous week signals
+7. Compare week-over-week progress
+8. Return final report
 
-1. User uploads WSR file with metadata (`account`, `project_name`, `week_date`).
-2. System extracts text from file (PDF/PPTX/DOCX/TXT).
-3. System cleans text and removes common noise.
-4. System chunks text and stores vectors with metadata in `.wsr_vector_db.json`.
-5. System detects risk/dependency signals (explicit sections first, keyword fallback).
-6. System retrieves similar historical chunks (metadata-filtered vector similarity).
-7. System outputs analysis + reporting gaps + recommendations.
+## Environment Variables
+- `OPENAI_API_KEY`
+- `PINECONE_API_KEY`
+- `PINECONE_INDEX` (optional, default: `wsr-agent-index`)
+- `PINECONE_CLOUD` (optional, default: `aws`)
+- `PINECONE_REGION` (optional, default: `us-east-1`)
 
 ## Setup
 
@@ -50,33 +48,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage (Python)
-
-```python
-from src.wsr_assurance.workflow import analyze_wsr_file
-
-report = analyze_wsr_file(
-    file_path="/path/to/wsr_week_2026_02_16.pdf",
-    account="Retail Banking",
-    project_name="Payments Modernization",
-    week_date="2026-02-16",
-)
-print(report)
-```
-
-## Week-over-Week Assurance
+## Usage
 
 ```python
 from src.wsr_assurance.delivery_assurance import RunMetadata, run_delivery_assurance
 
-result = run_delivery_assurance(
-    current_wsr_path="/path/current_week.docx",
+report = run_delivery_assurance(
+    current_wsr_path="/path/current_week.pdf",
     previous_wsr_path="/path/previous_week.pptx",
-    metadata=RunMetadata(project_id="Payments Modernization", week_date="2026-02-16", account="Retail Banking"),
+    metadata=RunMetadata(
+        project_id="Payments Modernization",
+        week_date="2026-02-16",
+        account="Retail Banking",
+    ),
 )
-print(result)
 ```
 
 ## Notes
-- For image-only scanned PDFs, OCR is required before extraction.
-- Local JSON vector DB is used for simplicity and easy adoption.
+- For scanned image-only files, OCR is required before ingestion.
+- The workflow uses deterministic parsing logic for signal extraction and progress tracking.

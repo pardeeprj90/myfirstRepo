@@ -1,18 +1,17 @@
-"""Backward-compatible helpers for PDF-only calls.
-
-New development should use ``src.wsr_assurance.workflow``.
-"""
+"""Backward compatibility wrappers for older PDF-only function names."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .workflow import analyze_wsr_file
+from .workflow import clean_wsr_text, extract_wsr_text_from_file
 
 
 @dataclass
 class PDFAnalysisResult:
+    """Legacy response shape retained for compatibility."""
+
     file_name: str
     page_count: int
     cleaned_text: str
@@ -32,5 +31,14 @@ class PDFAnalysisResult:
 
 
 def analyze_uploaded_pdf(file_path: str) -> Dict[str, object]:
-    """Compatibility wrapper mapping old API to the new workflow."""
-    return analyze_wsr_file(file_path=file_path, account="N/A", project_name="N/A", week_date="N/A")
+    """Extract and clean PDF text for legacy callers.
+
+    Full production analysis is available via workflow.analyze_wsr_file().
+    """
+    raw = extract_wsr_text_from_file(file_path)
+    cleaned = clean_wsr_text(raw)
+    return {
+        "file_name": file_path,
+        "cleaned_text": cleaned,
+        "message": "Use analyze_wsr_file(current_file_path, previous_file_path, ...) for LangGraph + Pinecone analysis.",
+    }

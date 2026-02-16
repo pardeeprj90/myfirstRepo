@@ -1,46 +1,43 @@
-# Technical Design Document
-## WSR Analysis Agent
+# Technical Design - WSR Analysis Agent
 
-## 1. Architecture
+## Stack
+- LangChain
+- LangGraph
+- Pinecone
 
-### 1.1 Ingestion Layer
-- `extract_wsr_text_from_file(...)` routes by extension.
-- Extractors:
-  - PDF via `pypdf`
-  - PPTX via `python-pptx`
-  - DOCX via `python-docx`
-  - TXT via plain file read
+## Core Components
 
-### 1.2 Processing Layer
-- `clean_wsr_text(...)` removes noise and normalizes format.
-- `sectionalize_text(...)` detects coarse sections.
-- `chunk_text(...)` creates overlap chunks for retrieval quality.
+1. `extract_wsr_text_from_file`
+   - Handles pdf/pptx/docx/txt extraction
 
-### 1.3 Vector Layer
-- `vectorize_text(...)` creates deterministic hashed vectors.
-- `LocalVectorDB` persists chunk records in `.wsr_vector_db.json`.
-- Query supports metadata filtering and cosine similarity ranking.
+2. `clean_wsr_text`
+   - Removes noise and normalizes content
 
-### 1.4 Analysis Layer
-- `detect_signals(...)` extracts risks/dependencies from explicit sections or fallback keywords.
-- `detect_reporting_gaps(...)` identifies missing owner/ETA/mitigation cues.
-- `build_recommendations(...)` creates action suggestions with historical context grounding.
+3. `chunk_wsr_text`
+   - Splits content into overlap chunks and attaches metadata
 
-### 1.5 Assurance Layer
-- `run_delivery_assurance(...)` compares current vs previous week outputs.
-- Deterministic matching via token-overlap scoring.
+4. Pinecone integration (`_get_vector_store`)
+   - Creates/uses index
+   - Stores and queries vectorized chunks
 
-## 2. Key Design Decisions
-- Keep logic deterministic and transparent.
-- Use local vector DB first for quick deployment.
-- Preserve backward-compatible top-level wrappers.
+5. Analysis helpers
+   - `_extract_signal_lines`
+   - `_detect_reporting_gaps`
+   - `_recommend_with_llm`
+   - `_compare_progress`
 
-## 3. Data Contracts
-- `WSRMetadata`: `account`, `project_name`, `week_date`
-- `ChunkRecord`: chunk text, vector, section, metadata
-- Analysis output: risks, dependencies, observation gaps, recommendations, retrieved context
+6. LangGraph workflow
+   - `preprocess_current`
+   - `preprocess_previous`
+   - `upsert_documents`
+   - `retrieve_history`
+   - `analyze_current`
+   - `analyze_previous`
+   - `compare_weeks`
+   - `build_report`
 
-## 4. Operational Notes
-- OCR is required for scanned documents.
-- Local vector store can be replaced by managed vector DB later.
-- Current design prioritizes readability and maintainability.
+## Output Contract
+- `current_week_analysis`
+- `previous_week_analysis`
+- `progress_comparison`
+- `retrieved_history_count`

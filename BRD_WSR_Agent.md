@@ -1,42 +1,27 @@
-# Business Requirements Document (BRD)
-## AI Weekly Status Report Analysis Agent
+# BRD - Weekly Status Report Analysis Agent
 
-## 1. Purpose
-Build an AI-powered agent to automate Weekly Status Report (WSR) analysis so Delivery Assurance teams can quickly identify risks, dependencies, and governance gaps from uploaded project files.
+## Problem Statement
+Delivery Assurance teams spend significant time manually reviewing weekly WSR files and may miss risks/dependencies in unstructured content.
 
-## 2. Current Pain Areas
-- Manual reading of weekly files (PDF/PPTX/DOCX) is time-consuming.
-- Risk/dependency detection quality depends heavily on reviewer experience.
-- Important signals are often hidden in messy or unstructured status content.
-- Repeated weekly effort does not systematically reuse past learning.
+## Business Need
+Create an AI agent that automates WSR analysis for current and previous week reports using retrieval-backed context and consistent rules.
 
-## 3. Target Outcomes
-- Reduce manual first-pass review effort.
-- Increase consistency in identifying delivery risks and dependencies.
-- Improve escalation readiness with structured observations and recommendations.
+## Scope
+### In Scope
+- Multi-format WSR ingestion: PDF, PPTX, DOCX, TXT
+- Data cleaning and chunking
+- Metadata tagging (`account`, `project_name`, `week_date`)
+- Pinecone vector storage and filtered retrieval
+- Risk/dependency extraction
+- Reporting gap identification
+- Recommendation generation
+- Previous-week progress tracking
 
-## 4. In Scope
-- Multi-format WSR ingestion: PDF, PPTX, DOCX, TXT.
-- Data cleaning: repetitive header/footer-like noise, whitespace normalization.
-- Section-aware chunking.
-- Metadata-enriched vector storage (`account`, `project_name`, `week_date`).
-- Analysis outputs:
-  - Risks
-  - Dependencies
-  - Observation/reporting gaps
-  - Recommendations based on historical context.
+### Out of Scope
+- OCR engine implementation
+- Automatic ticket creation in external tools
 
-## 5. Out of Scope (Current Phase)
-- OCR engine for image-only scanned content.
-- External ticketing tool automation.
-- Fully autonomous decisioning without DA review.
-
-## 6. Primary Users
-- Delivery Assurance Analysts
-- PMO teams
-- Program and Delivery Managers
-
-## 7. Success Criteria
-- Reliable ingestion and analysis across supported file types.
-- Structured analysis output with clear risk/dependency visibility.
-- Historical context retrieval is metadata-scoped and relevant.
+## Success Criteria
+- Faster weekly WSR review
+- Improved consistency of risk/dependency identification
+- Clear progress tracking from previous week

@@ -1,99 +1,36 @@
-"""Production-oriented WSR analysis workflow.
+"""LangChain + LangGraph + Pinecone WSR analysis workflow.
 
-This module implements the main flow requested for Delivery Assurance:
-1. Accept uploaded WSR files (PDF/PPTX/DOCX/TXT).
-2. Extract and clean messy content.
-3. Chunk and vectorize with metadata.
-4. Persist to a local vector database.
-5. Analyze risks, dependencies, reporting gaps, and recommendations.
+This module implements a production-oriented agent flow for Weekly Status Reports:
+- Multi-format extraction: PDF, PPTX, DOCX, TXT
+- Data cleaning and chunking
+- Metadata-rich vector upsert and retrieval in Pinecone
+- Structured risk/dependency/gap/recommendation analysis
+- Week-over-week progress comparison (current vs previous file)
 """
 
 from __future__ import annotations
 
 import json
-import math
+import os
 import re
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, TypedDict
 
+from docx import Document as DocxDocument
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import END, StateGraph
+from pinecone import Pinecone, ServerlessSpec
+from pypdf import PdfReader
+from pptx import Presentation
 
-
-# -----------------------------
-# Data contracts
-# -----------------------------
-
-
-@dataclass
-class WSRMetadata:
-    """Metadata provided by UI or ingestion APIs."""
-
-    account: str
-    project_name: str
-    week_date: str
-
-
-@dataclass
-class ChunkRecord:
-    """Persisted vector store record for one text chunk."""
-
-    id: str
-    doc_id: str
-    chunk_index: int
-    text: str
-    section: str
-    vector: List[float]
-    metadata: Dict[str, str]
-
-
-@dataclass
-class SignalItem:
-    """Detected risk/dependency item from current WSR."""
-
-    item_type: str
-    description: str
-    source: str
-
-
-RISK_KEYWORDS = {
-    "risk",
-    "issue",
-    "blocked",
-    "delay",
-    "slippage",
-    "escalation",
-    "defect",
-    "quality",
-    "rework",
-}
-
-DEPENDENCY_KEYWORDS = {
-    "dependency",
-    "dependent",
-    "pending",
-    "awaiting",
-    "approval",
-    "sign-off",
-    "external",
-    "vendor",
-    "client",
-}
-
-HEADING_MAP = {
-    "risks": "risks",
-    "risk": "risks",
-    "issues": "risks",
-    "dependencies": "dependencies",
-    "dependency": "dependencies",
-    "summary": "summary",
-    "highlights": "summary",
-    "milestones": "milestones",
-    "progress": "milestones",
-    "actions": "actions",
-}
 
 NOISE_PATTERNS = [
     r"^page\s+\d+\s+of\s+\d+$",
@@ -102,16 +39,54 @@ NOISE_PATTERNS = [
     r"^weekly status report$",
 ]
 
-TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{2,}")
+SECTION_HINTS = {
+    "risks": ["risks", "risk", "issues", "concerns"],
+    "dependencies": ["dependencies", "dependency", "external dependency"],
+}
+
+
+@dataclass
+class WSRMetadata:
+    """Metadata provided by the UI or upstream caller."""
+
+    account: str
+    project_name: str
+    week_date: str
+
+    def to_filter(self) -> Dict[str, Any]:
+        """Metadata filter used for vector retrieval scope."""
+        return {
+            "account": self.account,
+            "project_name": self.project_name,
+        }
+
+
+class WorkflowState(TypedDict, total=False):
+    current_file_path: str
+    previous_file_path: str
+    metadata: Dict[str, str]
+    current_raw_text: str
+    previous_raw_text: str
+    current_cleaned_text: str
+    previous_cleaned_text: str
+    current_chunks: List[Document]
+    previous_chunks: List[Document]
+    current_doc_id: str
+    previous_doc_id: str
+    retrieved_history: List[Document]
+    current_analysis: Dict[str, Any]
+    previous_analysis: Dict[str, Any]
+    progress_comparison: List[Dict[str, str]]
+    final_report: Dict[str, Any]
 
 
 # -----------------------------
-# Extraction
+# Extraction and cleaning
 # -----------------------------
 
 
 def extract_wsr_text_from_file(file_path: str) -> str:
-    """Extract text from supported file types: PDF, PPTX, DOCX, TXT."""
+    """Extract text from PDF, PPTX, DOCX, or TXT."""
     path = Path(file_path)
     suffix = path.suffix.lower()
     if suffix == ".pdf":
@@ -126,439 +101,500 @@ def extract_wsr_text_from_file(file_path: str) -> str:
 
 
 def _extract_pdf(file_path: str) -> str:
-    from pypdf import PdfReader
-
     reader = PdfReader(file_path)
     pages: List[str] = []
-    for index, page in enumerate(reader.pages, start=1):
+    for idx, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()
         if text:
-            pages.append(f"[PAGE {index}]\n{text}")
+            pages.append(f"[PAGE {idx}]\n{text}")
     if not pages:
-        raise ValueError("No extractable text found in PDF. OCR is required for scanned files.")
+        raise ValueError("No extractable text in PDF. OCR is required for scanned files.")
     return "\n\n".join(pages)
 
 
 def _extract_pptx(file_path: str) -> str:
-    from pptx import Presentation
-
     prs = Presentation(file_path)
     lines: List[str] = []
-    for slide_num, slide in enumerate(prs.slides, start=1):
-        lines.append(f"[SLIDE {slide_num}]")
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        lines.append(f"[SLIDE {slide_idx}]")
         for shape in slide.shapes:
             if hasattr(shape, "text") and shape.text:
                 lines.append(shape.text.strip())
             if getattr(shape, "has_table", False):
                 for row in shape.table.rows:
-                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
                     if cells:
                         lines.append(" | ".join(cells))
             if getattr(shape, "has_chart", False):
                 chart = shape.chart
-                try:
-                    series_dump: List[str] = []
-                    for series in chart.series:
-                        points = [str(v) for v in series.values]
-                        series_dump.append(f"{series.name}: {', '.join(points)}")
-                    if series_dump:
-                        lines.append("Chart -> " + " ; ".join(series_dump))
-                except Exception:
-                    # Chart extraction support varies by deck/chart type.
-                    pass
+                series_dump: List[str] = []
+                for series in chart.series:
+                    values = [str(v) for v in series.values]
+                    series_dump.append(f"{series.name}: {', '.join(values)}")
+                if series_dump:
+                    lines.append("Chart -> " + " ; ".join(series_dump))
     text = "\n".join([ln for ln in lines if ln.strip()])
-    if not text.strip():
-        raise ValueError("No extractable text found in PPTX.")
+    if not text:
+        raise ValueError("No extractable text in PPTX.")
     return text
 
 
 def _extract_docx(file_path: str) -> str:
-    from docx import Document
-
-    doc = Document(file_path)
-    lines: List[str] = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    doc = DocxDocument(file_path)
+    lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
         for row in table.rows:
-            row_values = [c.text.strip() for c in row.cells if c.text.strip()]
-            if row_values:
-                lines.append(" | ".join(row_values))
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                lines.append(" | ".join(cells))
     text = "\n".join(lines)
-    if not text.strip():
-        raise ValueError("No extractable text found in DOCX.")
+    if not text:
+        raise ValueError("No extractable text in DOCX.")
     return text
 
 
-# -----------------------------
-# Cleaning and chunking
-# -----------------------------
-
-
 def clean_wsr_text(raw_text: str) -> str:
-    """Normalize whitespace and remove common header/footer noise."""
-    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n") if ln.strip()]
+    """Remove header/footer-like noise and normalize whitespace."""
+    normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in normalized.split("\n") if ln.strip()]
 
-    # Drop repetitive header/footer lines by frequency.
     line_counts = Counter(lines)
-    threshold = max(2, int(len(lines) * 0.25))
+    repeat_threshold = max(2, int(len(lines) * 0.25))
 
-    cleaned: List[str] = []
+    filtered: List[str] = []
     for line in lines:
-        lower = line.lower()
-        if any(re.match(p, lower) for p in NOISE_PATTERNS):
+        low = line.lower()
+        if any(re.match(pattern, low) for pattern in NOISE_PATTERNS):
             continue
-        if line_counts[line] >= threshold and len(line) < 80:
+        if line_counts[line] >= repeat_threshold and len(line) < 90:
             continue
-        cleaned.append(line)
+        filtered.append(line)
 
-    return "\n".join(cleaned).strip()
-
-
-def sectionalize_text(cleaned_text: str) -> List[Tuple[str, str]]:
-    """Split document into coarse sections based on heading-like lines."""
-    current_section = "general"
-    sections: List[Tuple[str, List[str]]] = [(current_section, [])]
-
-    for line in cleaned_text.splitlines():
-        canonical = line.lower().strip(" :")
-        if canonical in HEADING_MAP:
-            current_section = HEADING_MAP[canonical]
-            sections.append((current_section, []))
-            continue
-        sections[-1][1].append(line)
-
-    return [(name, "\n".join(lines).strip()) for name, lines in sections if "\n".join(lines).strip()]
+    return "\n".join(filtered).strip()
 
 
-def chunk_text(cleaned_text: str, chunk_size: int = 900, overlap: int = 120) -> List[Dict[str, str]]:
-    """Create metadata-friendly chunks using section boundaries + char windows."""
-    chunks: List[Dict[str, str]] = []
-    for section, section_text in sectionalize_text(cleaned_text):
-        start = 0
-        while start < len(section_text):
-            end = min(len(section_text), start + chunk_size)
-            chunk_value = section_text[start:end].strip()
-            if chunk_value:
-                chunks.append({"section": section, "text": chunk_value})
-            if end == len(section_text):
-                break
-            start = max(0, end - overlap)
-    return chunks
+def chunk_wsr_text(cleaned_text: str, metadata: WSRMetadata, doc_id: str) -> List[Document]:
+    """Chunk cleaned text while attaching metadata for Pinecone filtering."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=120)
+    raw_chunks = splitter.split_text(cleaned_text)
 
-
-# -----------------------------
-# Vector storage
-# -----------------------------
-
-
-def _tokenize(text: str) -> List[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text)]
-
-
-def vectorize_text(text: str, dim: int = 256) -> List[float]:
-    """Convert text into a deterministic hashed vector for similarity search."""
-    vec = [0.0] * dim
-    tokens = _tokenize(text)
-    if not tokens:
-        return vec
-
-    for token in tokens:
-        index = hash(token) % dim
-        vec[index] += 1.0
-
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
-
-
-def cosine_similarity(left: List[float], right: List[float]) -> float:
-    return sum(a * b for a, b in zip(left, right))
-
-
-class LocalVectorDB:
-    """Lightweight JSON-backed vector database for WSR chunks.
-
-    This keeps setup simple while preserving production-friendly metadata filters.
-    """
-
-    def __init__(self, path: str = ".wsr_vector_db.json"):
-        self.path = Path(path)
-        self.records: List[ChunkRecord] = []
-        self._load()
-
-    def _load(self) -> None:
-        if not self.path.exists():
-            self.records = []
-            return
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        self.records = [ChunkRecord(**item) for item in data]
-
-    def _save(self) -> None:
-        data = [asdict(record) for record in self.records]
-        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-    def add_document(self, doc_id: str, chunks: List[Dict[str, str]], metadata: WSRMetadata) -> int:
-        base_meta = {
-            "account": metadata.account,
-            "project_name": metadata.project_name,
-            "week_date": metadata.week_date,
-            "ingested_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        }
-        for index, chunk in enumerate(chunks):
-            text = chunk["text"]
-            record = ChunkRecord(
-                id=str(uuid.uuid4()),
-                doc_id=doc_id,
-                chunk_index=index,
-                text=text,
-                section=chunk["section"],
-                vector=vectorize_text(text),
-                metadata=base_meta,
+    docs: List[Document] = []
+    for idx, chunk in enumerate(raw_chunks):
+        section = infer_section(chunk)
+        docs.append(
+            Document(
+                page_content=chunk,
+                metadata={
+                    "doc_id": doc_id,
+                    "chunk_id": f"{doc_id}-{idx}",
+                    "chunk_index": idx,
+                    "section": section,
+                    "account": metadata.account,
+                    "project_name": metadata.project_name,
+                    "week_date": metadata.week_date,
+                },
             )
-            self.records.append(record)
-        self._save()
-        return len(chunks)
+        )
+    return docs
 
-    def query(
-        self,
-        query_text: str,
-        metadata: WSRMetadata,
-        exclude_doc_id: str,
-        top_k: int = 8,
-    ) -> List[Dict[str, Any]]:
-        query_vec = vectorize_text(query_text)
-        candidates: List[Tuple[float, ChunkRecord]] = []
-        for record in self.records:
-            if record.doc_id == exclude_doc_id:
-                continue
-            if record.metadata.get("account") != metadata.account:
-                continue
-            if record.metadata.get("project_name") != metadata.project_name:
-                continue
-            score = cosine_similarity(query_vec, record.vector)
-            if score > 0:
-                candidates.append((score, record))
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return [
-            {
-                "score": round(score, 4),
-                "chunk_text": rec.text,
-                "section": rec.section,
-                "week_date": rec.metadata.get("week_date", ""),
-                "doc_id": rec.doc_id,
-            }
-            for score, rec in candidates[:top_k]
-        ]
+def infer_section(text: str) -> str:
+    """Infer a coarse section label for a chunk."""
+    low = text.lower()
+    for section, hints in SECTION_HINTS.items():
+        if any(h in low for h in hints):
+            return section
+    return "general"
 
 
 # -----------------------------
-# Analysis logic
+# Pinecone + LLM services
 # -----------------------------
 
 
-def _extract_bullets(text: str) -> List[str]:
-    bullets: List[str] = []
-    for line in text.splitlines():
-        if re.match(r"^[-*•]\s+", line):
-            bullets.append(re.sub(r"^[-*•]\s+", "", line).strip())
-    return bullets
+def _build_embeddings() -> OpenAIEmbeddings:
+    return OpenAIEmbeddings(model="text-embedding-3-small")
 
 
-def detect_signals(cleaned_text: str) -> List[SignalItem]:
-    """Detect risks/dependencies from explicit sections or keyword signals."""
-    sections = dict(sectionalize_text(cleaned_text))
-    items: List[SignalItem] = []
-
-    risk_text = sections.get("risks", "")
-    dep_text = sections.get("dependencies", "")
-
-    if risk_text or dep_text:
-        for line in _extract_bullets(risk_text):
-            items.append(SignalItem(item_type="Risk", description=line, source="Explicit section"))
-        for line in _extract_bullets(dep_text):
-            items.append(SignalItem(item_type="Dependency", description=line, source="Explicit section"))
-
-    if not items:
-        for line in cleaned_text.splitlines():
-            lower = line.lower()
-            has_risk = any(word in lower for word in RISK_KEYWORDS)
-            has_dep = any(word in lower for word in DEPENDENCY_KEYWORDS)
-            if has_risk or has_dep:
-                item_type = "Dependency" if has_dep and not has_risk else "Risk"
-                items.append(SignalItem(item_type=item_type, description=line, source="Keyword fallback"))
-
-    return items[:20]
+def _build_llm() -> ChatOpenAI:
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
-def detect_reporting_gaps(items: List[SignalItem]) -> List[str]:
-    """Identify common WSR reporting quality gaps from extracted signal lines."""
+def _get_vector_store(index_name: str | None = None) -> PineconeVectorStore:
+    """Create Pinecone index if needed, then return LangChain vector store."""
+    pinecone_api_key = os.environ.get("PINECONE_API_KEY")
+    if not pinecone_api_key:
+        raise ValueError("PINECONE_API_KEY is required.")
+
+    index = index_name or os.environ.get("PINECONE_INDEX", "wsr-agent-index")
+    cloud = os.environ.get("PINECONE_CLOUD", "aws")
+    region = os.environ.get("PINECONE_REGION", "us-east-1")
+
+    pc = Pinecone(api_key=pinecone_api_key)
+    existing = [item.name for item in pc.list_indexes()]
+    if index not in existing:
+        pc.create_index(
+            name=index,
+            dimension=1536,
+            metric="cosine",
+            spec=ServerlessSpec(cloud=cloud, region=region),
+        )
+
+    return PineconeVectorStore(index_name=index, embedding=_build_embeddings())
+
+
+# -----------------------------
+# Analysis helpers
+# -----------------------------
+
+
+def _extract_signal_lines(cleaned_text: str) -> Dict[str, List[Dict[str, str]]]:
+    """Extract risk/dependency lines with explicit-section-first strategy."""
+    lines = cleaned_text.splitlines()
+    risks: List[Dict[str, str]] = []
+    dependencies: List[Dict[str, str]] = []
+
+    current_section = "general"
+    for line in lines:
+        normalized = line.lower().strip(" :")
+        if normalized in SECTION_HINTS["risks"]:
+            current_section = "risks"
+            continue
+        if normalized in SECTION_HINTS["dependencies"]:
+            current_section = "dependencies"
+            continue
+
+        if current_section in {"risks", "dependencies"} and re.match(r"^[-*•]", line):
+            item = {"description": re.sub(r"^[-*•]\s*", "", line).strip(), "source": "Explicit section"}
+            if current_section == "risks":
+                risks.append(item)
+            else:
+                dependencies.append(item)
+
+    if risks or dependencies:
+        return {"risks": risks[:20], "dependencies": dependencies[:20]}
+
+    # Fallback for unstructured files.
+    for line in lines:
+        low = line.lower()
+        if any(word in low for word in ["dependency", "pending", "awaiting", "vendor", "client"]):
+            dependencies.append({"description": line, "source": "Keyword fallback"})
+        elif any(word in low for word in ["risk", "issue", "blocked", "delay", "slippage", "defect"]):
+            risks.append({"description": line, "source": "Keyword fallback"})
+
+    return {"risks": risks[:20], "dependencies": dependencies[:20]}
+
+
+def _detect_reporting_gaps(analysis: Dict[str, List[Dict[str, str]]]) -> List[str]:
+    """Detect missing owner/date/mitigation cues in extracted items."""
     gaps: List[str] = []
-    for item in items:
-        text = item.description.lower()
-        if not re.search(r"\bowner\b|\b@[a-zA-Z0-9_.-]+\b", text):
-            gaps.append(f"Missing owner in {item.item_type.lower()}: {item.description[:120]}")
-        if not re.search(r"\b\d{4}-\d{2}-\d{2}\b|\beta\b|\bdue\b|\btarget\b", text):
-            gaps.append(f"Missing due date/ETA in {item.item_type.lower()}: {item.description[:120]}")
-        if not re.search(r"\bmitigation\b|\baction\b|\bplan\b", text):
-            gaps.append(f"Missing mitigation/action in {item.item_type.lower()}: {item.description[:120]}")
+    for label, items in [("risk", analysis["risks"]), ("dependency", analysis["dependencies"])]:
+        for item in items:
+            text = item["description"].lower()
+            if "owner" not in text and "@" not in text:
+                gaps.append(f"Missing owner in {label}: {item['description'][:100]}")
+            if not re.search(r"\b\d{4}-\d{2}-\d{2}\b|\beta\b|\bdue\b|\btarget\b", text):
+                gaps.append(f"Missing ETA/due date in {label}: {item['description'][:100]}")
+            if not re.search(r"\bmitigation\b|\baction\b|\bplan\b", text):
+                gaps.append(f"Missing mitigation/action in {label}: {item['description'][:100]}")
 
-    # Keep response concise and deterministic.
-    unique_gaps = []
+    unique: List[str] = []
     seen = set()
     for gap in gaps:
         if gap not in seen:
             seen.add(gap)
-            unique_gaps.append(gap)
-    return unique_gaps[:10]
+            unique.append(gap)
+    return unique[:12]
 
 
-def build_recommendations(items: List[SignalItem], context_chunks: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Generate deterministic recommendations using current signals + historical context."""
-    recommendations: List[Dict[str, str]] = []
-    context_preview = " ".join(ch["chunk_text"][:120] for ch in context_chunks[:3]).lower()
+def _recommend_with_llm(
+    current_analysis: Dict[str, List[Dict[str, str]]],
+    retrieved_history: List[Document],
+) -> List[Dict[str, str]]:
+    """Generate recommendations grounded in extracted signals + retrieved history."""
+    parser = JsonOutputParser()
+    llm = _build_llm()
 
-    for item in items[:8]:
-        desc = item.description
-        if item.item_type == "Dependency":
-            action = "Create a dependency tracker with owner, ETA, and escalation path."
-        else:
-            action = "Define mitigation owner, due date, and weekly control checkpoint."
+    history_text = "\n\n".join(
+        f"- [{doc.metadata.get('week_date', 'N/A')}] {doc.page_content[:320]}"
+        for doc in retrieved_history[:8]
+    )
 
-        if "vendor" in desc.lower() or "vendor" in context_preview:
-            action = "Escalate vendor dependency in governance call and lock recovery milestones."
-        if "uat" in desc.lower() or "test" in desc.lower():
-            action = "Introduce daily test environment health checks and defect triage."
+    messages = [
+        SystemMessage(
+            content=(
+                "You are a delivery assurance analyst. Use only provided data. "
+                "Return JSON array. Each item: for, signal, recommendation, rationale."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"Current analysis:\n{json.dumps(current_analysis, indent=2)}\n\n"
+                f"Historical context:\n{history_text}\n\n"
+                "Create concise actionable recommendations."
+            )
+        ),
+    ]
 
-        recommendations.append(
+    output = llm.invoke(messages)
+    parsed = parser.parse(output.content)
+
+    if isinstance(parsed, list):
+        return [
             {
-                "for": item.item_type,
-                "signal": desc,
-                "recommendation": action,
-                "basis": item.source,
+                "for": str(item.get("for", "Risk")),
+                "signal": str(item.get("signal", "N/A")),
+                "recommendation": str(item.get("recommendation", "N/A")),
+                "rationale": str(item.get("rationale", "N/A")),
             }
-        )
+            for item in parsed
+        ][:10]
 
-    return recommendations
+    return []
 
 
-def _format_signal_rows(items: List[SignalItem]) -> List[Dict[str, str]]:
-    return [{"type": i.item_type, "description": i.description, "source": i.source} for i in items]
+def _tokenize(text: str) -> set[str]:
+    return {token.lower() for token in re.findall(r"[a-zA-Z0-9_-]{3,}", text)}
+
+
+def _compare_progress(
+    current_analysis: Dict[str, Any],
+    previous_analysis: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Track progress from previous week using deterministic token overlap."""
+    current_items = [i["description"] for i in current_analysis["risks"] + current_analysis["dependencies"]]
+    previous_items = [i["description"] for i in previous_analysis["risks"] + previous_analysis["dependencies"]]
+
+    results: List[Dict[str, str]] = []
+    matched_previous: set[str] = set()
+
+    for current in current_items:
+        cur_tokens = _tokenize(current)
+        best_score = 0.0
+        best_prev = ""
+        for prev in previous_items:
+            prev_tokens = _tokenize(prev)
+            if not cur_tokens or not prev_tokens:
+                continue
+            score = len(cur_tokens & prev_tokens) / max(1, len(cur_tokens | prev_tokens))
+            if score > best_score:
+                best_score = score
+                best_prev = prev
+
+        if best_score >= 0.45:
+            matched_previous.add(best_prev)
+            status = "Existing (same signal)" if current == best_prev else "Existing (updated wording)"
+            results.append({"current": current, "previous": best_prev, "status": status})
+        else:
+            results.append({"current": current, "previous": "N/A", "status": "New signal"})
+
+    for prev in previous_items:
+        if prev not in matched_previous:
+            results.append({"current": "N/A", "previous": prev, "status": "No longer reported"})
+
+    return results
 
 
 # -----------------------------
-# Public APIs
+# LangGraph nodes
 # -----------------------------
+
+
+def _preprocess_current(state: WorkflowState) -> WorkflowState:
+    metadata = WSRMetadata(**state["metadata"])
+    raw_text = extract_wsr_text_from_file(state["current_file_path"])
+    cleaned = clean_wsr_text(raw_text)
+    doc_id = f"current:{metadata.week_date}:{uuid.uuid4().hex[:8]}"
+    chunks = chunk_wsr_text(cleaned, metadata, doc_id)
+
+    state["current_raw_text"] = raw_text
+    state["current_cleaned_text"] = cleaned
+    state["current_chunks"] = chunks
+    state["current_doc_id"] = doc_id
+    return state
+
+
+def _preprocess_previous(state: WorkflowState) -> WorkflowState:
+    metadata = WSRMetadata(**state["metadata"])
+    raw_text = extract_wsr_text_from_file(state["previous_file_path"])
+    cleaned = clean_wsr_text(raw_text)
+    doc_id = f"previous:{metadata.week_date}:{uuid.uuid4().hex[:8]}"
+    chunks = chunk_wsr_text(cleaned, metadata, doc_id)
+
+    state["previous_raw_text"] = raw_text
+    state["previous_cleaned_text"] = cleaned
+    state["previous_chunks"] = chunks
+    state["previous_doc_id"] = doc_id
+    return state
+
+
+def _upsert_documents(state: WorkflowState) -> WorkflowState:
+    store = _get_vector_store()
+    store.add_documents(state["current_chunks"])
+    store.add_documents(state["previous_chunks"])
+    return state
+
+
+def _retrieve_history(state: WorkflowState) -> WorkflowState:
+    store = _get_vector_store()
+    metadata = WSRMetadata(**state["metadata"])
+
+    current_signals = _extract_signal_lines(state["current_cleaned_text"])
+    query_text = "\n".join([i["description"] for i in current_signals["risks"] + current_signals["dependencies"]])
+    if not query_text.strip():
+        query_text = state["current_cleaned_text"][:1200]
+
+    docs = store.similarity_search(
+        query=query_text,
+        k=8,
+        filter=metadata.to_filter(),
+    )
+
+    # Remove chunks from current/previous doc ids to focus on older history.
+    excluded = {state["current_doc_id"], state["previous_doc_id"]}
+    state["retrieved_history"] = [d for d in docs if d.metadata.get("doc_id") not in excluded]
+    return state
+
+
+def _analyze_current(state: WorkflowState) -> WorkflowState:
+    analysis = _extract_signal_lines(state["current_cleaned_text"])
+    analysis["observation_gaps"] = _detect_reporting_gaps(analysis)
+    analysis["recommendations"] = _recommend_with_llm(analysis, state.get("retrieved_history", []))
+    state["current_analysis"] = analysis
+    return state
+
+
+def _analyze_previous(state: WorkflowState) -> WorkflowState:
+    state["previous_analysis"] = _extract_signal_lines(state["previous_cleaned_text"])
+    return state
+
+
+def _compare_weeks(state: WorkflowState) -> WorkflowState:
+    state["progress_comparison"] = _compare_progress(
+        current_analysis=state["current_analysis"],
+        previous_analysis=state["previous_analysis"],
+    )
+    return state
+
+
+def _build_report(state: WorkflowState) -> WorkflowState:
+    state["final_report"] = {
+        "metadata": state["metadata"],
+        "current_week_analysis": state["current_analysis"],
+        "previous_week_analysis": state["previous_analysis"],
+        "progress_comparison": state["progress_comparison"],
+        "retrieved_history_count": len(state.get("retrieved_history", [])),
+    }
+    return state
+
+
+# -----------------------------
+# Public workflow entrypoints
+# -----------------------------
+
+
+def build_workflow():
+    """Build LangGraph workflow for current-vs-previous WSR analysis."""
+    graph = StateGraph(WorkflowState)
+    graph.add_node("preprocess_current", _preprocess_current)
+    graph.add_node("preprocess_previous", _preprocess_previous)
+    graph.add_node("upsert_documents", _upsert_documents)
+    graph.add_node("retrieve_history", _retrieve_history)
+    graph.add_node("analyze_current", _analyze_current)
+    graph.add_node("analyze_previous", _analyze_previous)
+    graph.add_node("compare_weeks", _compare_weeks)
+    graph.add_node("build_report", _build_report)
+
+    graph.set_entry_point("preprocess_current")
+    graph.add_edge("preprocess_current", "preprocess_previous")
+    graph.add_edge("preprocess_previous", "upsert_documents")
+    graph.add_edge("upsert_documents", "retrieve_history")
+    graph.add_edge("retrieve_history", "analyze_current")
+    graph.add_edge("analyze_current", "analyze_previous")
+    graph.add_edge("analyze_previous", "compare_weeks")
+    graph.add_edge("compare_weeks", "build_report")
+    graph.add_edge("build_report", END)
+
+    return graph.compile()
+
+
+def analyze_wsr_file(
+    current_file_path: str,
+    previous_file_path: str,
+    account: str,
+    project_name: str,
+    week_date: str,
+) -> Dict[str, Any]:
+    """Analyze current WSR and track progress from previous week file."""
+    app = build_workflow()
+    result = app.invoke(
+        {
+            "current_file_path": current_file_path,
+            "previous_file_path": previous_file_path,
+            "metadata": {
+                "account": account,
+                "project_name": project_name,
+                "week_date": week_date,
+            },
+        }
+    )
+    return result["final_report"]
 
 
 def ingest_wsr_file_from_ui(file_path: str, account: str, project_name: str, week_date: str) -> int:
-    """Ingest uploaded WSR into local vector DB with chunk metadata."""
-    metadata = WSRMetadata(account=account.strip(), project_name=project_name.strip(), week_date=week_date.strip())
+    """Ingest one WSR file into Pinecone with metadata."""
+    metadata = WSRMetadata(account=account, project_name=project_name, week_date=week_date)
     raw_text = extract_wsr_text_from_file(file_path)
-    cleaned_text = clean_wsr_text(raw_text)
-    chunks = chunk_text(cleaned_text)
-
-    vector_db = LocalVectorDB()
-    doc_id = f"{Path(file_path).name}:{week_date}:{uuid.uuid4().hex[:8]}"
-    return vector_db.add_document(doc_id=doc_id, chunks=chunks, metadata=metadata)
-
-
-def ingest_wsr_from_ui(current_wsr_text: str, account: str, project_name: str, week_date: str) -> int:
-    """Backward-compatible text ingestion path using same chunk/vector pipeline."""
-    metadata = WSRMetadata(account=account.strip(), project_name=project_name.strip(), week_date=week_date.strip())
-    cleaned_text = clean_wsr_text(current_wsr_text)
-    chunks = chunk_text(cleaned_text)
-
-    vector_db = LocalVectorDB()
-    doc_id = f"text:{week_date}:{uuid.uuid4().hex[:8]}"
-    return vector_db.add_document(doc_id=doc_id, chunks=chunks, metadata=metadata)
-
-
-def analyze_wsr_file(file_path: str, account: str, project_name: str, week_date: str) -> Dict[str, Any]:
-    """Analyze uploaded WSR file and return systematic DA report."""
-    metadata = WSRMetadata(account=account.strip(), project_name=project_name.strip(), week_date=week_date.strip())
-
-    raw_text = extract_wsr_text_from_file(file_path)
-    cleaned_text = clean_wsr_text(raw_text)
-    chunks = chunk_text(cleaned_text)
-
-    vector_db = LocalVectorDB()
-    doc_id = f"{Path(file_path).name}:{week_date}:{uuid.uuid4().hex[:8]}"
-    ingested_chunks = vector_db.add_document(doc_id=doc_id, chunks=chunks, metadata=metadata)
-
-    signal_items = detect_signals(cleaned_text)
-    query_text = "\n".join(item.description for item in signal_items) if signal_items else cleaned_text[:1500]
-    context = vector_db.query(query_text=query_text, metadata=metadata, exclude_doc_id=doc_id, top_k=8)
-
-    risks = [item for item in signal_items if item.item_type == "Risk"]
-    dependencies = [item for item in signal_items if item.item_type == "Dependency"]
-    gaps = detect_reporting_gaps(signal_items)
-    recommendations = build_recommendations(signal_items, context)
-
-    return {
-        "metadata": asdict(metadata),
-        "file_name": Path(file_path).name,
-        "doc_id": doc_id,
-        "ingested_chunks": ingested_chunks,
-        "analysis": {
-            "risks": _format_signal_rows(risks),
-            "dependencies": _format_signal_rows(dependencies),
-            "observation_gaps": gaps,
-            "recommendations": recommendations,
-        },
-        "retrieved_context": context,
-    }
+    cleaned = clean_wsr_text(raw_text)
+    doc_id = f"ingest:{week_date}:{uuid.uuid4().hex[:8]}"
+    chunks = chunk_wsr_text(cleaned, metadata, doc_id)
+    store = _get_vector_store()
+    store.add_documents(chunks)
+    return len(chunks)
 
 
 def analyze_wsr(current_wsr_text: str, account: str, project_name: str, week_date: str) -> Dict[str, Any]:
-    """Analyze raw WSR text with same pipeline used for uploaded files."""
-    metadata = WSRMetadata(account=account.strip(), project_name=project_name.strip(), week_date=week_date.strip())
-
-    cleaned_text = clean_wsr_text(current_wsr_text)
-    chunks = chunk_text(cleaned_text)
-
-    vector_db = LocalVectorDB()
-    doc_id = f"text:{week_date}:{uuid.uuid4().hex[:8]}"
-    ingested_chunks = vector_db.add_document(doc_id=doc_id, chunks=chunks, metadata=metadata)
-
-    signal_items = detect_signals(cleaned_text)
-    query_text = "\n".join(item.description for item in signal_items) if signal_items else cleaned_text[:1500]
-    context = vector_db.query(query_text=query_text, metadata=metadata, exclude_doc_id=doc_id, top_k=8)
-
-    risks = [item for item in signal_items if item.item_type == "Risk"]
-    dependencies = [item for item in signal_items if item.item_type == "Dependency"]
-
-    return {
-        "metadata": asdict(metadata),
-        "doc_id": doc_id,
-        "ingested_chunks": ingested_chunks,
-        "analysis": {
-            "risks": _format_signal_rows(risks),
-            "dependencies": _format_signal_rows(dependencies),
-            "observation_gaps": detect_reporting_gaps(signal_items),
-            "recommendations": build_recommendations(signal_items, context),
-        },
-        "retrieved_context": context,
+    """Compatibility API. Prefer file-based analyze_wsr_file for production use."""
+    metadata = {
+        "account": account,
+        "project_name": project_name,
+        "week_date": week_date,
     }
+    basic = _extract_signal_lines(clean_wsr_text(current_wsr_text))
+    basic["observation_gaps"] = _detect_reporting_gaps(basic)
+    return {"metadata": metadata, "current_week_analysis": basic, "message": "Use analyze_wsr_file for full LangGraph flow."}
+
+
+def ingest_wsr_from_ui(current_wsr_text: str, account: str, project_name: str, week_date: str) -> int:
+    """Compatibility API for text ingestion path."""
+    metadata = WSRMetadata(account=account, project_name=project_name, week_date=week_date)
+    doc_id = f"ingest-text:{week_date}:{uuid.uuid4().hex[:8]}"
+    chunks = chunk_wsr_text(clean_wsr_text(current_wsr_text), metadata, doc_id)
+    store = _get_vector_store()
+    store.add_documents(chunks)
+    return len(chunks)
 
 
 def main() -> None:
-    """CLI entrypoint for manual testing."""
+    """CLI helper for manual run."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Analyze uploaded WSR file (.pdf/.pptx/.docx/.txt)")
-    parser.add_argument("file_path", help="Path to uploaded WSR file")
+    parser = argparse.ArgumentParser(description="Analyze current WSR and compare with previous week")
+    parser.add_argument("current_file_path")
+    parser.add_argument("previous_file_path")
     parser.add_argument("--account", required=True)
     parser.add_argument("--project-name", required=True)
     parser.add_argument("--week-date", required=True)
     args = parser.parse_args()
 
-    result = analyze_wsr_file(
-        file_path=args.file_path,
+    report = analyze_wsr_file(
+        current_file_path=args.current_file_path,
+        previous_file_path=args.previous_file_path,
         account=args.account,
         project_name=args.project_name,
         week_date=args.week_date,
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
