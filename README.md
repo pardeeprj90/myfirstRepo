@@ -19,9 +19,27 @@ Production-oriented LangChain + LangGraph workflow for Weekly Status Report (WSR
   1. retrieve similar historical chunks
   2. generate recommendations
 
+## Project structure
+
+```text
+.
+├── src/
+│   └── wsr_assurance/
+│       ├── __init__.py
+│       ├── delivery_assurance.py
+│       └── workflow.py
+├── delivery_assurance_agent.py   # backward-compatible wrapper
+├── wsr_agent_workflow.py         # backward-compatible wrapper
+├── sample_past_wsr.json
+└── requirements.txt
+```
+
 ## Files
 
-- `wsr_agent_workflow.py` - File extraction, ingestion, and analysis workflow.
+- `src/wsr_assurance/workflow.py` - File extraction, ingestion, vector retrieval, and recommendation workflow.
+- `src/wsr_assurance/delivery_assurance.py` - Deterministic governance/audit analysis engine.
+- `wsr_agent_workflow.py` - Backward-compatible import wrapper for workflow module.
+- `delivery_assurance_agent.py` - Backward-compatible import wrapper for assurance module.
 - `sample_past_wsr.json` - Seed dataset with account/project/week metadata.
 - `requirements.txt` - Python dependencies.
 
