@@ -1,57 +1,46 @@
 # Technical Design Document
-## WSR PDF Upload Analysis (Current Implementation)
+## WSR Analysis Agent
 
-## 1. Design Intent
-Deliver a clean production-oriented codebase focused on one flow:
+## 1. Architecture
 
-**Upload PDF -> Extract -> Clean -> Detect Risks/Dependencies -> Return JSON**
+### 1.1 Ingestion Layer
+- `extract_wsr_text_from_file(...)` routes by extension.
+- Extractors:
+  - PDF via `pypdf`
+  - PPTX via `python-pptx`
+  - DOCX via `python-docx`
+  - TXT via plain file read
 
-## 2. Code Structure
-```text
-src/wsr_assurance/
-├── pdf_analysis.py        # core pipeline logic
-├── workflow.py            # API facade + CLI entrypoint
-├── delivery_assurance.py  # compatibility facade
-└── __init__.py            # package exports
-```
+### 1.2 Processing Layer
+- `clean_wsr_text(...)` removes noise and normalizes format.
+- `sectionalize_text(...)` detects coarse sections.
+- `chunk_text(...)` creates overlap chunks for retrieval quality.
 
-Backward-compatible wrappers remain:
-- `wsr_agent_workflow.py`
-- `delivery_assurance_agent.py`
+### 1.3 Vector Layer
+- `vectorize_text(...)` creates deterministic hashed vectors.
+- `LocalVectorDB` persists chunk records in `.wsr_vector_db.json`.
+- Query supports metadata filtering and cosine similarity ranking.
 
-## 3. Component Design
-### 3.1 `pdf_analysis.py`
-Primary functions:
-- `extract_pdf_text(file_path)`
-- `clean_wsr_text(raw_text)`
-- `extract_risks_and_dependencies(cleaned_text)`
-- `build_summary(risks, dependencies, cleaned_text)`
-- `analyze_uploaded_pdf(file_path)`
+### 1.4 Analysis Layer
+- `detect_signals(...)` extracts risks/dependencies from explicit sections or fallback keywords.
+- `detect_reporting_gaps(...)` identifies missing owner/ETA/mitigation cues.
+- `build_recommendations(...)` creates action suggestions with historical context grounding.
 
-Data contract:
-- `PDFAnalysisResult` dataclass with `to_dict()` for API output.
+### 1.5 Assurance Layer
+- `run_delivery_assurance(...)` compares current vs previous week outputs.
+- Deterministic matching via token-overlap scoring.
 
-### 3.2 `workflow.py`
-- `analyze_wsr_file(...)` is the primary API method.
-- Attaches UI metadata to analysis output.
-- Provides CLI `main()` for local usage.
+## 2. Key Design Decisions
+- Keep logic deterministic and transparent.
+- Use local vector DB first for quick deployment.
+- Preserve backward-compatible top-level wrappers.
 
-### 3.3 `delivery_assurance.py`
-- Compatibility adapter around the same PDF analysis flow.
-- Returns current vs previous analysis side-by-side.
+## 3. Data Contracts
+- `WSRMetadata`: `account`, `project_name`, `week_date`
+- `ChunkRecord`: chunk text, vector, section, metadata
+- Analysis output: risks, dependencies, observation gaps, recommendations, retrieved context
 
-## 4. Error Handling
-- Reject non-PDF input in extraction stage.
-- Return clear error for scanned/image PDFs with no extractable text.
-
-## 5. Runtime Dependencies
-- `pypdf`
-
-## 6. Operational Notes
-- OCR should be handled before calling this service for scanned PDFs.
-- This simplified version intentionally avoids orchestration layers and external stores.
-
-## 7. Future Extension Points
-- Add OCR preprocessing module.
-- Add richer table extraction if needed.
-- Add recommendation layer only after stable extraction quality baseline.
+## 4. Operational Notes
+- OCR is required for scanned documents.
+- Local vector store can be replaced by managed vector DB later.
+- Current design prioritizes readability and maintainability.

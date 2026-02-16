@@ -1,46 +1,42 @@
 # Business Requirements Document (BRD)
-## WSR PDF Upload Analysis
+## AI Weekly Status Report Analysis Agent
 
 ## 1. Purpose
-Build a simple and reliable service where a user uploads a Weekly Status Report (WSR) PDF and immediately receives analysis of delivery risks and dependencies.
+Build an AI-powered agent to automate Weekly Status Report (WSR) analysis so Delivery Assurance teams can quickly identify risks, dependencies, and governance gaps from uploaded project files.
 
 ## 2. Current Pain Areas
-- WSR review is manual and slow.
-- Different report formats cause inconsistent analysis quality.
-- Key risk/dependency signals are often buried in long narrative text.
+- Manual reading of weekly files (PDF/PPTX/DOCX) is time-consuming.
+- Risk/dependency detection quality depends heavily on reviewer experience.
+- Important signals are often hidden in messy or unstructured status content.
+- Repeated weekly effort does not systematically reuse past learning.
 
-## 3. Business Goal
-Reduce the time needed for first-pass WSR review by automating PDF extraction and deterministic risk/dependency signal detection.
-
-## 4. Scope
-### In Scope
-- PDF upload-based analysis.
-- Text extraction from PDF pages.
-- Text cleaning (noise removal, whitespace normalization).
-- Risk/dependency signal extraction.
-- Deterministic JSON response for API/UI.
-
-### Out of Scope
-- PPTX/DOCX ingestion.
-- Vector database, retrieval orchestration, and recommendation ranking.
-- OCR processing for image-only scanned PDFs.
-
-## 5. Users
-- PMO analysts
-- Delivery managers
-- Program leads
-
-## 6. Success Criteria
-- User can upload PDF and receive analysis response consistently.
-- Response includes extracted risks, dependencies, and concise summary.
-- Code is easy to understand and maintain.
-
-## 7. KPI Targets
+## 3. Target Outcomes
 - Reduce manual first-pass review effort.
-- Improve consistency of weekly risk/dependency signal reporting.
-- Keep onboarding and maintenance effort low through clean code structure.
+- Increase consistency in identifying delivery risks and dependencies.
+- Improve escalation readiness with structured observations and recommendations.
 
-## 8. Constraints and Assumptions
-- PDFs are text-extractable.
-- OCR is handled outside this service when needed.
-- API/UI provides metadata (`account`, `project_name`, `week_date`) for traceability.
+## 4. In Scope
+- Multi-format WSR ingestion: PDF, PPTX, DOCX, TXT.
+- Data cleaning: repetitive header/footer-like noise, whitespace normalization.
+- Section-aware chunking.
+- Metadata-enriched vector storage (`account`, `project_name`, `week_date`).
+- Analysis outputs:
+  - Risks
+  - Dependencies
+  - Observation/reporting gaps
+  - Recommendations based on historical context.
+
+## 5. Out of Scope (Current Phase)
+- OCR engine for image-only scanned content.
+- External ticketing tool automation.
+- Fully autonomous decisioning without DA review.
+
+## 6. Primary Users
+- Delivery Assurance Analysts
+- PMO teams
+- Program and Delivery Managers
+
+## 7. Success Criteria
+- Reliable ingestion and analysis across supported file types.
+- Structured analysis output with clear risk/dependency visibility.
+- Historical context retrieval is metadata-scoped and relevant.
