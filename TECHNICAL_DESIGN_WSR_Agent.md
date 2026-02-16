@@ -41,3 +41,10 @@
 - `previous_week_analysis`
 - `progress_comparison`
 - `retrieved_history_count`
+
+
+## File Storage Strategy
+- User uploads file through UI (no manual path input).
+- Backend stores file in server/object storage and registers metadata.
+- Registry returns `file_id` used for analysis calls.
+- Previous week file is auto-selected by same account/project with nearest earlier `week_date`.

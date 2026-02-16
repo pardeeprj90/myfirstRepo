@@ -25,3 +25,10 @@ Create an AI agent that automates WSR analysis for current and previous week rep
 - Faster weekly WSR review
 - Improved consistency of risk/dependency identification
 - Clear progress tracking from previous week
+
+
+## File Storage Strategy
+- User uploads file through UI (no manual path input).
+- Backend stores file in server/object storage and registers metadata.
+- Registry returns `file_id` used for analysis calls.
+- Previous week file is auto-selected by same account/project with nearest earlier `week_date`.

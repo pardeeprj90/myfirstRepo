@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from .workflow import analyze_wsr_file
+from .workflow import analyze_uploaded_wsr, analyze_wsr_file
 
 
 @dataclass
@@ -30,3 +30,8 @@ def run_delivery_assurance(current_wsr_path: str, previous_wsr_path: str, metada
         project_name=metadata.project_id,
         week_date=metadata.week_date,
     )
+
+
+def run_delivery_assurance_for_uploaded_file(current_file_id: str) -> Dict[str, Any]:
+    """Run assurance flow using uploaded file id (auto resolves previous week file)."""
+    return analyze_uploaded_wsr(current_file_id)

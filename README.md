@@ -23,8 +23,21 @@ src/wsr_assurance/
 └── __init__.py
 ```
 
+## User Upload Strategy (No user file path needed)
+
+In production, users upload files via UI. Backend should:
+1. Save the uploaded file to server/object storage.
+2. Register that stored file using `upload_wsr_file(...)`.
+3. Store returned `file_id` in DB.
+4. Run analysis via `analyze_uploaded_wsr(file_id)`.
+
+The agent auto-finds previous week file for same `account + project_name` by `week_date`.
+
+- Week 1 upload: no previous found -> current-only analysis.
+- Week 2 upload: week 1 auto-selected as previous -> progress comparison enabled.
+
 ## Workflow Stages
-1. Extract current + previous file text
+1. Extract current + previous file text (if previous exists)
 2. Clean/normalize content
 3. Chunk with metadata (`account`, `project_name`, `week_date`, `doc_id`)
 4. Upsert chunks to Pinecone
@@ -48,22 +61,32 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## Usage - Upload and Analyze by File ID
 
 ```python
-from src.wsr_assurance.delivery_assurance import RunMetadata, run_delivery_assurance
+from src.wsr_assurance.workflow import upload_wsr_file, analyze_uploaded_wsr
 
-report = run_delivery_assurance(
-    current_wsr_path="/path/current_week.pdf",
-    previous_wsr_path="/path/previous_week.pptx",
-    metadata=RunMetadata(
-        project_id="Payments Modernization",
-        week_date="2026-02-16",
-        account="Retail Banking",
-    ),
+# Week 1
+file_id_week1 = upload_wsr_file(
+    file_path="/srv/uploads/wsr_2026_02_01.pdf",
+    account="Retail Banking",
+    project_name="Payments Modernization",
+    week_date="2026-02-01",
 )
+report_week1 = analyze_uploaded_wsr(file_id_week1)
+
+# Week 2
+file_id_week2 = upload_wsr_file(
+    file_path="/srv/uploads/wsr_2026_02_08.pdf",
+    account="Retail Banking",
+    project_name="Payments Modernization",
+    week_date="2026-02-08",
+)
+report_week2 = analyze_uploaded_wsr(file_id_week2)
+# report_week2 automatically compares against week1
 ```
 
 ## Notes
 - For scanned image-only files, OCR is required before ingestion.
-- The workflow uses deterministic parsing logic for signal extraction and progress tracking.
+- `WSRFileRegistry` uses `.wsr_file_registry.json` in this repo for demo/reference implementation.
+- Replace registry JSON with DB + object storage URI in production.

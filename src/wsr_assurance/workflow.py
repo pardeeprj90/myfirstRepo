@@ -16,6 +16,7 @@ import re
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
@@ -60,6 +61,70 @@ class WSRMetadata:
             "project_name": self.project_name,
         }
 
+
+
+
+@dataclass
+class UploadedFileRecord:
+    """Stored reference for a user-uploaded WSR file."""
+
+    file_id: str
+    file_path: str
+    account: str
+    project_name: str
+    week_date: str
+    uploaded_at: str
+
+
+class WSRFileRegistry:
+    """Simple JSON registry that maps uploaded file IDs to storage paths and metadata.
+
+    In production this should be replaced by a database table and object storage URI.
+    """
+
+    def __init__(self, path: str = '.wsr_file_registry.json'):
+        self.path = Path(path)
+        self.records: List[UploadedFileRecord] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self.records = []
+            return
+        raw = json.loads(self.path.read_text(encoding='utf-8'))
+        self.records = [UploadedFileRecord(**item) for item in raw]
+
+    def _save(self) -> None:
+        self.path.write_text(json.dumps([asdict(r) for r in self.records], indent=2), encoding='utf-8')
+
+    def register_upload(self, file_path: str, account: str, project_name: str, week_date: str) -> str:
+        rec = UploadedFileRecord(
+            file_id=str(uuid.uuid4()),
+            file_path=file_path,
+            account=account,
+            project_name=project_name,
+            week_date=week_date,
+            uploaded_at=datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        )
+        self.records.append(rec)
+        self._save()
+        return rec.file_id
+
+    def get(self, file_id: str) -> UploadedFileRecord:
+        for rec in self.records:
+            if rec.file_id == file_id:
+                return rec
+        raise ValueError(f'File id not found: {file_id}')
+
+    def find_previous(self, account: str, project_name: str, week_date: str, current_file_id: str) -> UploadedFileRecord | None:
+        candidates = [
+            r for r in self.records
+            if r.account == account and r.project_name == project_name and r.file_id != current_file_id and r.week_date < week_date
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda r: (r.week_date, r.uploaded_at), reverse=True)
+        return candidates[0]
 
 class WorkflowState(TypedDict, total=False):
     current_file_path: str
@@ -518,14 +583,50 @@ def build_workflow():
     return graph.compile()
 
 
+def _analyze_current_only(current_file_path: str, account: str, project_name: str, week_date: str) -> Dict[str, Any]:
+    """Analyze only current week when no previous file exists."""
+    metadata = WSRMetadata(account=account, project_name=project_name, week_date=week_date)
+    raw_text = extract_wsr_text_from_file(current_file_path)
+    cleaned = clean_wsr_text(raw_text)
+    doc_id = f"current:{week_date}:{uuid.uuid4().hex[:8]}"
+    chunks = chunk_wsr_text(cleaned, metadata, doc_id)
+
+    store = _get_vector_store()
+    store.add_documents(chunks)
+
+    current_analysis = _extract_signal_lines(cleaned)
+    current_analysis["observation_gaps"] = _detect_reporting_gaps(current_analysis)
+
+    query_text = "\n".join([i["description"] for i in current_analysis["risks"] + current_analysis["dependencies"]])
+    if not query_text.strip():
+        query_text = cleaned[:1200]
+
+    docs = store.similarity_search(query=query_text, k=8, filter=metadata.to_filter())
+    history_docs = [d for d in docs if d.metadata.get("doc_id") != doc_id]
+
+    current_analysis["recommendations"] = _recommend_with_llm(current_analysis, history_docs)
+
+    return {
+        "metadata": asdict(metadata),
+        "current_week_analysis": current_analysis,
+        "previous_week_analysis": {},
+        "progress_comparison": [],
+        "retrieved_history_count": len(history_docs),
+        "note": "No previous week file was available. Current-week-only analysis executed.",
+    }
+
+
 def analyze_wsr_file(
     current_file_path: str,
-    previous_file_path: str,
+    previous_file_path: str | None,
     account: str,
     project_name: str,
     week_date: str,
 ) -> Dict[str, Any]:
-    """Analyze current WSR and track progress from previous week file."""
+    """Analyze current WSR and track progress from previous week when available."""
+    if not previous_file_path:
+        return _analyze_current_only(current_file_path, account, project_name, week_date)
+
     app = build_workflow()
     result = app.invoke(
         {
@@ -539,6 +640,39 @@ def analyze_wsr_file(
         }
     )
     return result["final_report"]
+
+
+def upload_wsr_file(file_path: str, account: str, project_name: str, week_date: str) -> str:
+    """Register uploaded file and return generated file_id for user/API flows."""
+    # Validate the file is parsable before storing reference.
+    _ = extract_wsr_text_from_file(file_path)
+    registry = WSRFileRegistry()
+    return registry.register_upload(file_path=file_path, account=account, project_name=project_name, week_date=week_date)
+
+
+def analyze_uploaded_wsr(current_file_id: str) -> Dict[str, Any]:
+    """Analyze latest uploaded WSR and auto-link previous file from registry metadata."""
+    registry = WSRFileRegistry()
+    current = registry.get(current_file_id)
+    previous = registry.find_previous(
+        account=current.account,
+        project_name=current.project_name,
+        week_date=current.week_date,
+        current_file_id=current.file_id,
+    )
+
+    previous_path = previous.file_path if previous else None
+    report = analyze_wsr_file(
+        current_file_path=current.file_path,
+        previous_file_path=previous_path,
+        account=current.account,
+        project_name=current.project_name,
+        week_date=current.week_date,
+    )
+
+    report["current_file_id"] = current.file_id
+    report["previous_file_id"] = previous.file_id if previous else None
+    return report
 
 
 def ingest_wsr_file_from_ui(file_path: str, account: str, project_name: str, week_date: str) -> int:
@@ -581,7 +715,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Analyze current WSR and compare with previous week")
     parser.add_argument("current_file_path")
-    parser.add_argument("previous_file_path")
+    parser.add_argument("--previous-file-path", default=None)
     parser.add_argument("--account", required=True)
     parser.add_argument("--project-name", required=True)
     parser.add_argument("--week-date", required=True)
