@@ -1,22 +1,15 @@
-"""WSR assurance package.
-
-This package separates concerns into production-oriented modules while
-preserving legacy top-level entrypoints.
-"""
+"""WSR assurance package exports."""
 
 from .delivery_assurance import RunMetadata, run_delivery_assurance
-from .workflow import (
-    WSRMetadata,
-    analyze_wsr,
-    analyze_wsr_file,
-    ingest_wsr_file_from_ui,
-    ingest_wsr_from_ui,
-)
+from .pdf_analysis import PDFAnalysisResult, analyze_uploaded_pdf
+from .workflow import WSRMetadata, analyze_wsr, analyze_wsr_file, ingest_wsr_file_from_ui, ingest_wsr_from_ui
 
 __all__ = [
     "RunMetadata",
-    "WSRMetadata",
     "run_delivery_assurance",
+    "PDFAnalysisResult",
+    "analyze_uploaded_pdf",
+    "WSRMetadata",
     "analyze_wsr",
     "analyze_wsr_file",
     "ingest_wsr_from_ui",
