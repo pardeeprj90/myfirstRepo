@@ -1,10 +1,10 @@
 # WSR PDF Analysis
 
-This project is now simplified to one clear use case:
+This project supports one simple use case:
 
-**User uploads a WSR PDF → system extracts content → system returns risk/dependency analysis.**
+**User uploads a WSR PDF -> system extracts content -> system returns risk/dependency analysis.**
 
-## Clean project structure
+## Project Structure
 
 ```text
 .
@@ -12,20 +12,22 @@ This project is now simplified to one clear use case:
 │   └── wsr_assurance/
 │       ├── pdf_analysis.py        # core PDF extraction + analysis logic
 │       ├── workflow.py            # API/CLI-facing orchestration
-│       ├── delivery_assurance.py  # compatibility entrypoint
+│       ├── delivery_assurance.py  # compatibility facade
 │       └── __init__.py
 ├── wsr_agent_workflow.py          # backward-compatible wrapper
 ├── delivery_assurance_agent.py    # backward-compatible wrapper
+├── BRD_WSR_Agent.md
+├── FRD_AI_Delivery_Assurance_Agent.md
+├── TECHNICAL_DESIGN_WSR_Agent.md
 ├── requirements.txt
 └── README.md
 ```
 
-## What happens on PDF upload
-
+## Processing Flow
 1. Extract text from all PDF pages.
 2. Clean whitespace and remove noise lines.
 3. Detect risks and dependencies (section-first, keyword fallback).
-4. Return deterministic JSON output with summary bullets.
+4. Return deterministic JSON output.
 
 ## Setup
 
@@ -55,7 +57,6 @@ print(result)
 python wsr_agent_workflow.py /path/to/wsr.pdf --account "Retail Banking" --project-name "Payments Modernization" --week-date "2026-02-16"
 ```
 
-## Note
-
+## Notes
 - This version is intentionally simple and readable.
-- If PDF is scanned/image-only, OCR is required before analysis.
+- For image-only scanned PDFs, run OCR before analysis.
