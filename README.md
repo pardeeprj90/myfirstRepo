@@ -40,3 +40,8 @@ pip install -r requirements.txt
 2. Analyze current file.
 3. Auto-pick previous week file (same account + project) if available.
 4. Generate risks, dependencies, gaps, recommendations, and progress comparison.
+
+
+## Dependency Baseline
+- This project tracks modern LangChain/LangGraph package lines (`langchain>=0.3`, `langgraph>=0.3`).
+- Imports are split-package style (`langchain_core`, `langchain_openai`, `langchain_text_splitters`, `langchain_pinecone`), aligned with current releases.
